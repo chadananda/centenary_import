@@ -1,0 +1,512 @@
+<?php
+
+/**
+ * @file
+ * This is a helper module for the Centenary website which provides import tools
+ *
+ * Centenary nodes each have time a location fields allowing them to be mapped to a SIMILE timeline  + map
+ *
+ */
+ 
+ 
+ 
+ /**
+ * Implementation of hook_menu().
+ */
+function ci_menu() {
+  $items = array();
+  $items['admin/settings/centenary'] = array( 
+    'title' => 'Centenary Tools',
+   // 'page callback' => 'drupal_get_form',
+   // 'page arguments' => array('ci_import_talks'),  
+    'page callback' => 'ci_import_talks_forms', 
+    'access callback' => TRUE,
+    'type' => MENU_NORMAL_ITEM,
+  );
+  $items['admin/settings/centenary/import_talks'] = array(
+    'title' => 'Import Talks',
+   // 'page callback' => 'drupal_get_form',
+   // 'page arguments' => array('ci_import_talks'),  
+    'page callback' => 'ci_import_talks_forms', 
+    'access callback' => TRUE,
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => 0,
+  );
+
+  $items['admin/settings/centenary/import_diary'] = array(
+    'title' => 'Import Diary Entries',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ci_import_talks'),  
+    'access callback' => TRUE,
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 1,
+  );
+  /*  $items['admin/settings/centenary/excerpts'] = array(
+    'title' => 'Import "God Passes By"',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ci_pup_import'),  
+    'access callback' => TRUE,
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 2,
+  );*/
+  return $items;
+}
+ 
+ 
+ 
+ 
+function ci_import_talks_forms() {
+  $result = drupal_get_form('ci_import_talks');  
+  $result .= drupal_get_form('ci_multiple_audio_upload_form');  
+  return $result;
+} 
+
+
+
+ 
+
+/**
+ * A form with a file upload field.
+ *
+ * This allows the user to upload a file to Drupal which is parsed
+ * for divs which can be imported as nodes. If a matching node is found
+ * then an update will take place instead.
+ * 
+ *
+ */
+function ci_import_talks($form_state) { 
+  // enctype="multipart/form-data" required by browsers to handle files. 
+  $form = array(
+    '#attributes' => array('enctype' => "multipart/form-data"),
+  ); 
+  // upload resource file
+  $filepath = 'sites/default/files/centenary_resources/talks/promulgation_universal_peace.html'; 
+  $display = l('Promulgation of Universal Peace', $filepath, array('attributes' => array('target' => '_blank')));
+  $description =  'Resource files are HTML5 files of books or documents with special "centenary_resource" tags wrapped around areas that can be'.
+                  ' imported into this website.<br/>'.
+                  ' For an example consider downloading and studying the HTML source of: '. $display;     
+  $form['file'] = array(
+    '#type' => 'file',
+    '#title' => t('Import Talks - Centenary Resource HTML File'),
+    '#description' => $description,  
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit'),
+  ); 
+  return $form;
+}
+/**
+ * Submit handler for form_example_tutorial_11().
+ */
+function ci_import_talks_submit($form, &$form_state) {  
+  // $file->filepath = 'sites/default/files/centenary_resources/talks/promulgation_universal_peace.html'; 
+ 
+  $file = $form_state['storage']['file']; 
+  // We are done with the file, remove it from storage.
+  unset($form_state['storage']['file']);
+  // Make the storage of the file permanent
+  file_set_status($file, FILE_STATUS_PERMANENT);
+  // Set a response to the user.
+
+  drupal_set_message(t('The file has uploaded and saved, filename: @filename.', array('@filename' => $file->filename))); 
+  // Find all "centenary_resource" divs    
+  foreach (htmlqp($file->filepath, '.centenary_resource') as $resource) $items[$resource->attr('id')] = $resource->attr('id');   
+  //  batch for processing each item into a node
+  $batch = array(
+    'operations' => array(
+       array('ci_talk_import_batch_op', array($items, $file->filepath)),
+    ),
+   'finished' => 'ci_talk_import_batch_finished',
+   'title' => t('Processing Talk nodes from @title', array('@title' => basename($file->filepath))),
+   'init_message' => t('Starting...'),
+   'progress_message' => t('Batch @current out of @total'),
+   'error_message' => t('An error occurred and some or all of the batch has failed.'),
+  );
+  batch_set($batch); 
+} 
+/**
+ * Validate handler for ci_import_talks().
+ * Verify the valid 'html' extensions.
+ */
+function ci_import_talks_validate($form, &$form_state) {  
+  // array('file_validate_extensions' => array('html', 'htm'))
+  $file = file_save_upload('file', NULL, 'sites/default/files/centenary_resources/talks', FILE_EXISTS_REPLACE);
+  // If the file passed validation:
+  if (isset($file->filename)) {
+    // Move the file, into the Drupal file system
+    if (file_move($file, $file->filename)) {
+      // Update the new file location in the database.
+      drupal_write_record('files', $file, 'fid');
+      // Save the file for use in the submit handler.
+      $form_state['storage']['file'] = $file;
+    }
+    else {
+      form_set_error('file', t('Failed to write the uploaded file the site\'s file folder.'));
+    }
+  }
+  else {
+    form_set_error('file', t('Invalid file, only html files are allowed'));
+  }  
+} 
+
+
+/** 
+* Standard Batch Op implementation
+* I've moved the actual work to ci_create_update_talk in order to keep this focused
+* on managing batch op counting (I never remember how to do this)
+* 
+* @param $items
+*   Array of centenary_resource ids in the document identified by $filepath
+*
+* @param $filepath
+*   The local file path to the document being parsed. The document must be HTML5 with appropriate meta fields
+*   such as html[lang] (eg "en"), title (doc title), title[data-uid] (doc acronymn)
+*    
+*/
+function ci_talk_import_batch_op($items = array(), $filepath, &$context) {
+  // initialize counters when not set 
+  if (!isset($context['sandbox']['progress'])) {
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['max'] = count($items);
+  }  
+  if(!isset($context['sandbox']['items'])) $context['sandbox']['items'] = $items; 
+  // process the current item
+  if(!empty($context['sandbox']['items'])) {  
+    $id = array_shift($context['sandbox']['items']);   
+    
+    ci_create_update_talk($id, $filepath); // this does the actual processing work, the reset is all OP counting
+
+    // update context     
+    $context['sandbox']['progress']++;
+    $context['message'] = t('Now processing node %node of %count', array('%node' => $context['sandbox']['progress'], '%count' => $context['sandbox']['max']));
+    $context['results']['nodes'] = $context['sandbox']['progress'];
+  } 
+  if ($context['sandbox']['progress'] != $context['sandbox']['max']) $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max']; 
+}
+/** 
+* Standard Batch finished function, does nothing here but show error message
+* I've left it here in case I want to extend it later  
+*/
+function ci_talk_import_batch_finished($success, $results, $operations) {
+  if ($success) {
+    // Here we do something meaningful with the results.
+    $message = count($results) .' processed.';
+    $message .= theme('item_list', $results);
+  }
+  else {
+    // An error occurred.
+    // $operations contains the operations that remained unprocessed.
+    $error_operation = reset($operations);
+    $message = t('An error occurred while processing %error_operation with arguments: @arguments', array('%error_operation' => $error_operation[0], '@arguments' => print_r($error_operation[1], TRUE)));
+  }
+  //drupal_set_message($message);
+}
+ 
+ 
+/** 
+* Create or update a node from data in a centenary_resource div or span. 
+* 
+* @param $id
+*   A resource id unique to this book and preferably unique across books, such as "pup_42" or "gpb_42_1"
+*   this must be an existing id attribute in the document
+*   resource section must have the following data attributes (with example values provided)
+*     data-date = "12 April 1912"
+*     data-description = "Home of Mr. and Mrs. Howard MacNutt"
+*     data-address = "935 Eastern Parkway"
+*     data-city-state-country = "Brooklyn, NY"
+*     data-created-by = "Howard MacNutt"
+*
+* @param $filepath
+*   The local file path to the document being parsed. The document must be HTML5 with appropriate meta fields
+*   such as html[lang] (eg "en"), title (doc title), title[data-uid] (doc acronymn)
+*   
+* @return
+*   Boolean success
+*/
+function ci_create_update_talk($id, $filepath) {   
+  if (!file_exists($filepath)) {drupal_set_message("ci_create_update_talk: File not exists: {$filepath}", 'error'); return;}
+  if (!$id) {drupal_set_message("ci_create_update_talk: ID not supplied: {$id}", 'error'); return;} 
+  
+  // for testing, limits number of nodes processed
+  $num = (int)substr($id, 4, 5);
+  if (($num<5) || ($num>6)) return; 
+  
+  // parse language and flow direction
+  $dom = htmlqp($filepath, 'html'); 
+  $doc_lang = $dom->attr('lang'); $doc_dir = $dom->attr('dir');
+  
+  // pull out doc title and uid
+  $dom->find(':root title');
+   $doc_title = $dom->text(); $doc_uid = $dom->attr('data-uid');
+   
+  // next, grab meta tags 
+  foreach ($dom->find(':root meta') as $metatag) if (($key=$metatag->attr('name')) && ($value=$metatag->attr('content'))) $meta[$key] = $value;   
+ 
+  // locate this node or create a new node object
+  if ($nids = _ci_content_node_loads(array('field_docid'=>$doc_uid, 'field_resid'=>$id))) {  
+    if (is_array($nids)) list($nid) = array_values($nids); 
+    if ((int)$nid  && ($node = node_load($nid))) $updated=TRUE;   
+  } 
+  if (!$node) { 
+    $node = new StdClass(); 
+    $node->uid = 1;
+    $node->type = 'talk';
+    $node->status = 1;
+    $node->language = $doc_lang;   
+    $updated = FALSE; 
+  }
+  
+  // locate the document resource in the DOM  
+  $dom->find(':root #'.$id);   
+  if (!$dom->size()) {drupal_set_message("Warning, could not find resource id in document: $id, $filepath", 'error'); return;}
+   
+  // cleanup html to remove excess windows line breaks etc 
+  $html = str_replace("\r\n", "\n", $dom->html());
+  $html = str_replace("&#13;", "\n", $html);
+  $html = str_replace(" \n", "\n", $html);
+  $html = str_replace("\n\n\n\n", "\n\n", $html);
+  $node->body = str_replace("\n\n\n", "\n\n", $html);
+  
+  // add or update main fields
+  $node->field_resid[0]['value'] = $id;
+  $node->field_docid[0]['value'] = $doc_uid;
+  $node->field_doctitle[0]['value'] = $doc_title; 
+  $node->field_talkdate[0]['value'] =  date('Y-m-d', strtotime($dom->attr('data-date'))); 
+  $node->field_recordedby[0]['value'] = $dom->attr('data-created-by');  
+  
+  // location info
+  list($city, $state, $country) = explode(',', $dom->attr('data-city-state-country')); 
+  $node->field_talkloc[0]['name'] = $dom->attr('data-description');
+  $node->field_talkloc[0]['street'] = $dom->attr('data-address');
+  $node->field_talkloc[0]['city'] = trim($city);
+  $node->field_talkloc[0]['province'] = trim($state);
+  $node->field_talkloc[0]['country'] = trim($country) ? trim(strtolower($country)) : 'us'; 
+  
+  $node->title = $dom->find('div.desc')->text(); 
+   
+  // Pause the batch
+  $batch =& batch_get();
+  $ref = $batch;
+  $batch = null;
+   // run your code with drupal_execute()
+  node_save($node);     
+  // Unpause the batch
+  $batch = $ref;
+  
+  if ($updated) drupal_set_message("Updated node: $id (nid {$node->nid}, ".l($node->title, 'node/'.$node->nid).")");
+    else drupal_set_message("Created node: $id  (nid {$node->nid}, ".l($node->title, 'node/'.$node->nid).")");
+    
+  //drupal_set_message("Node data: <pre>".print_r($node, TRUE)."</pre>");  
+ 
+}
+
+
+/** 
+* Load a list of matching nids using both core node fields and CCK fields.
+* See http://drupal.org/node/360541 (#25)
+* 
+* @param $param
+*   An array of conditions for core or CCK fields to match against in the database query 
+*   for example: array('field_owner'=>'Bob', 'language'=>'en')
+*
+* @return
+*   An array of nid's
+*/
+function _ci_content_node_loads($param = NULL) {
+  if (!is_array($param)) {
+    return FALSE;
+  }
+  $arguments = array();
+  $cck_tables = array();
+  $cck_cond = array();
+  $cond = array();
+  $i = 1;
+  foreach ($param as $key => $value) {
+    if (substr($key, 0, 6) != 'field_') {
+      $cond[] = 'n.'. db_escape_table($key) ." = '%s'";
+      $arguments[] = $value;
+    }
+    else{
+      $db_info = content_database_info(content_fields($key));
+      // If the field is from another table, increment sequence
+      if(!isset($cck_tables[$db_info['table']])){
+        $cck_tables[$db_info['table']] = 'cck'. $i;
+      }
+      $i++;
+      if($db_info['columns']['nid']){
+        // For nodereference fields
+        $cck_cond[] = $cck_tables[$db_info['table']] .'.'. db_escape_table($db_info['columns']['nid']['column']) ." = '%s'";
+      } else if ($db_info['columns']['value']) {
+        $cck_cond[] = $cck_tables[$db_info['table']] .'.'. db_escape_table($db_info['columns']['value']['column']) ." = '%s'";
+      } else if ($db_info['columns']['uid']) {
+        $cck_cond[] = $cck_tables[$db_info['table']] .'.'. db_escape_table($db_info['columns']['uid']['column']) ." = '%s'";
+      }else if ($db_info['columns'][$key]['column']) {
+        $cck_cond[] = $cck_tables[$db_info['table']] .'.'. db_escape_table($db_info['columns'][$key]['column']) ." = '%s'";
+      }
+      $arguments[] = $value;
+    }
+  }
+  $cond = (!empty($cond) ? implode(' AND ', $cond) : '' );
+  if (!empty($cck_cond)) {
+    $cond .= (!empty($cond) ? ' AND ' : ''). implode(' AND ', $cck_cond);
+    foreach ($cck_tables as $table => $nick) {
+      $cck_join .= ' INNER JOIN {'. $table .'} '. $nick .' ON '. $nick .'.nid = n.nid';
+    }
+  }
+  $sql = "SELECT n.nid FROM {node} n ".$cck_join." WHERE ".$cond;
+  $res = db_query(db_rewrite_sql($sql), $param);
+  $nids = array();
+  while ($nid = db_result($res)) {
+    $nids[$nid] = $nid;
+  }
+  return (empty($nids) ? FALSE : $nids);
+}
+
+
+/**
+ * A form with batch based multiple file upload (is it possible?)
+ *
+ * This will allow uploading of multiple audio files which will be automagically
+ * attached to the appropriate talk node based on parsing the filenanme and looking for that 
+ * value in the cck field_resid field
+ * 
+ *
+ */
+function ci_multiple_audio_upload_form($form_state) {  
+ /* drupal_add_js (
+    '$(document).ready(function(){$("input.multi_files").change(
+       function(){$("input.hidden_files").attr("value", $("input.multi_files").attr("value"));}
+     );}); ',
+    'inline'
+  );*/
+  // we're not actually uploading here, just collecting files
+  //$form = array('#attributes' => array('enctype' => "multipart/form-data")); 
+  //$form = array();
+  $description =  'Audio files should be MP3 and should begin with the resid delimited with a comma.' ;     
+  $form['files'] = array(
+    '#prefix' => '<br/><br/>',
+    '#type' => 'file',
+    '#title' => t('Import Talk Audio Files'),
+    '#description' => $description,  
+    '#attributes' => array('multiple'=>'multiple', 'class'=>'multi_files', 'accept'=>"image/gif,image/png"),
+  );
+  $form['hidden_files'] = array(
+    '#type' => 'hidden',    
+    '#value' => '',
+    '#attributes' => array('class' => 'hidden_files'),
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit'),
+  ); 
+  return $form;
+}
+/**
+ * Submit handler for ci_multiple_audio_upload_form().
+ */
+function ci_multiple_audio_upload_form_submit($form, &$form_state) {   
+  // clean up and then pass files list into a batch process, maybe filter at this point
+  ////$files = explode(',', $form_state['values']['files']); 
+  //foreach ($files as $key=>$file) $files[$key] = trim($file); 
+  drupal_set_message('ci_multiple_audio_upload_form_submit: <pre>'.print_r($_FILES, true)."</pre>");
+  //  batch for uploading each item 
+  $batch = array(
+    'operations' => array(
+       array('ci_import_audio_upload_op', array($files)),
+    ), 
+   'title' => t('Uploading audio files'),
+   'init_message' => t('Starting...'),
+   'progress_message' => t('Uploading @current out of @total'),
+   'error_message' => t('An error occurred and some or all of the batch has failed.'),
+  );
+ // batch_set($batch); 
+} 
+ 
+/** 
+* Standard Batch Op implementation
+* I've moved the actual work to ci_create_update_talk in order to keep this focused
+* on managing batch op counting (I never remember how to do this)
+* 
+* @param $items
+*   Array of centenary_resource ids in the document identified by $filepath
+*
+* @param $filepath
+*   The local file path to the document being parsed. The document must be HTML5 with appropriate meta fields
+*   such as html[lang] (eg "en"), title (doc title), title[data-uid] (doc acronymn)
+*    
+*/
+function ci_import_audio_upload_op($items = array(), &$context) {
+  // initialize counters when not set 
+  if (!isset($context['sandbox']['progress'])) {
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['max'] = count($items);
+  }  
+  if(!isset($context['sandbox']['items'])) $context['sandbox']['items'] = $items; 
+  // process the current item
+  if(!empty($context['sandbox']['items'])) {  
+  
+    $file = array_shift($context['sandbox']['items']);   
+    ci_import_audio_upload($file); // this does the actual uploading work, the rest is all OP counting
+
+    // update context     
+    $context['sandbox']['progress']++;
+    $context['message'] = t('Now uploading file %count of %max', array('%count' => $context['sandbox']['progress'], '%max' => $context['sandbox']['max']));
+    $context['results']['nodes'] = $context['sandbox']['progress'];
+  } 
+  if ($context['sandbox']['progress'] != $context['sandbox']['max']) $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max']; 
+}
+
+function ci_import_audio_upload($file) { 
+  drupal_set_message("ci_import_audio_upload($file)");
+  // Pause the batch
+  $batch =& batch_get();
+  $ref = $batch;
+  $batch = null;
+  // run your code with drupal_execute()
+  $form_state = array();
+  $form_state['values']['file'] = $file; 
+  drupal_execute('ci_hidden_upload_file_form', &$form_state); 
+  // Unpause the batch
+  $batch = $ref;  
+}
+
+
+function ci_hidden_upload_file_form() {
+ // enctype="multipart/form-data" required by browsers to handle files. 
+  $form = array('#attributes' => array('enctype' => "multipart/form-data")); 
+  // upload file form    
+  $form['file'] = array(
+    '#type' => 'file',     
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit'),
+  ); 
+  return $form;
+}
+function ci_hidden_upload_file_form_submit($form, &$form_state) { 
+  // build validation here
+  drupal_set_message("Uploading file: <pre>". print_r($form_state, true) ."</pre>");
+  /*
+  $file = file_save_upload('file', NULL, 'sites/default/files/centenary_resources/talks', FILE_EXISTS_REPLACE);
+  // If the file passed validation:
+  if (isset($file->filename)) {
+    // Move the file, into the Drupal file system
+    if (file_move($file, $file->filename)) {
+      // Update the new file location in the database.
+      drupal_write_record('files', $file, 'fid'); 
+    }
+  }   
+  // Make the storage of the file permanent
+  file_set_status($file, FILE_STATUS_PERMANENT);
+  // Set a response to the user.
+  drupal_set_message(t('File uploaded and saved, filename: @filename.', array('@filename' => $file->filename)));  
+  */
+} 
+
+
+
+
+
+

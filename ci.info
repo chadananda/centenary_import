@@ -1,0 +1,6 @@
+name = Centenary Import
+description = Import Centenary Resources as Timeline Nodes
+core = 6.x
+package = * Centenary Tools
+dependencies[] = querypath
+ 
